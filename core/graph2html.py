@@ -151,7 +151,7 @@ def generate_html(json_path: str, output_path: str):
         # Render attributes
         for k, v in node.items():
             if k in ['id', 'type']: continue
-            if k in ['arguments', 'content_preview'] or isinstance(v, (dict, list)):
+            if k in ['arguments', 'content', 'input_task', 'received_data_returns', 'received_task_returns'] or isinstance(v, (dict, list)):
                 formatted_json = json.dumps(v, indent=2, ensure_ascii=False) if not isinstance(v, str) else v
                 out.append(f"<div class='attr-row'><span class='attr-key'>{k}</span><span class='attr-val attr-val-json'>{formatted_json}</span></div>")
             else:

@@ -270,7 +270,8 @@ def parse_sessions(
 
         # 「输入的任务」和「收到的任务结果」先置空，遍历 entries 时填充
         task_input_text: Optional[str] = None
-        task_result_texts: List[str] = []  # 收集结果片段
+        received_data_returns: List[str] = []  # 收集 Data 节点返回
+        received_task_returns: List[str] = []  # 收集 subagent 返回
 
         graph.add_node(
             task_id,
@@ -284,10 +285,9 @@ def parse_sessions(
             model=meta.get("model"),
             provider=meta.get("modelProvider"),
             status="completed" if not meta.get("abortedLastRun") else "aborted",
-            input_tokens=meta.get("inputTokens"),
-            output_tokens=meta.get("outputTokens"),
-            输入的任务=task_input_text,
-            收到的任务结果=None,
+            input_task=task_input_text,
+            received_data_returns=None,
+            received_task_returns=None,
             started_at=None,
             ended_at=None,
         )
@@ -334,7 +334,7 @@ def parse_sessions(
 
             # ── User 消息 ────────────────────────────────────────────────
             if role == "user":
-                provenance = entry.get("provenance", {})
+                provenance = msg.get("provenance", {})
                 is_inter_session = provenance.get("kind") == "inter_session"
 
                 content = msg.get("content", [])
@@ -344,13 +344,29 @@ def parse_sessions(
                 ]
                 full_text = " ".join(text_parts)
 
+                # 先处理 inter_session（在过滤之前）
                 if is_inter_session:
-                    # main agent: 子任务上报 → 收集到「收到的任务结果」
+                    # main agent: 子任务上报 → 收集到 received_task_returns
                     if full_text.strip():
-                        task_result_texts.append(_text_preview(full_text, 400))
+                        # 提取子任务名称
+                        m_task = re.search(r'^task:\s*(.+)$', full_text, re.MULTILINE)
+                        subtask_label = m_task.group(1).strip() if m_task else provenance.get("sourceSessionKey", "unknown_subtask")
+                        
+                        # 提取 BEGIN_UNTRUSTED_CHILD_RESULT 和 END_UNTRUSTED_CHILD_RESULT 之间的内容
+                        match = re.search(
+                            r'<<<BEGIN_UNTRUSTED_CHILD_RESULT>>>(.*?)<<<END_UNTRUSTED_CHILD_RESULT>>>',
+                            full_text,
+                            re.DOTALL
+                        )
+                        if match:
+                            child_result = match.group(0).strip()
+                            received_task_returns.append(f"[{subtask_label}]\n{child_result}")
+                        else:
+                            # 如果没有找到标记，保存完整内容
+                            received_task_returns.append(f"[{subtask_label}]\n{full_text}")
                     continue
 
-                # 过滤系统注入内容
+                # 过滤系统注入内容（仅对非 inter_session 消息）
                 if "[OpenClaw runtime context (internal)]" in full_text:
                     continue
                 if "Post-compaction context refresh" in full_text:
@@ -361,7 +377,7 @@ def parse_sessions(
 
                 # 「输入的任务」：第一条 user 消息（main 或 subagent 均适用）
                 if task_input_text is None and full_text.strip():
-                    task_input_text = _text_preview(full_text, 500)
+                    task_input_text = full_text
 
                 # 提取 sender 信息
                 sender_label = "unknown"
@@ -482,16 +498,16 @@ def parse_sessions(
                     data_node_id, "Data",
                     tool_call_id=tc_id,
                     tool_name=tc_name,
-                    content_preview=_text_preview(full_result, 300),
+                    content=full_result,
                     content_length=len(full_result),
                     is_error=is_error,
                     timestamp=result_at,
                 )
 
-                # 收集 tool data 到「收到的任务结果」
+                # 收集 tool data 到 received_data_returns
                 if full_result.strip() and not is_error:
-                    task_result_texts.append(
-                        f"[{tc_name}] {_text_preview(full_result, 200)}"
+                    received_data_returns.append(
+                        f"[{tc_name}] {full_result}"
                     )
 
             # 边
@@ -514,12 +530,15 @@ def parse_sessions(
             }
 
         # ── 回填 Task「输入的任务」「收到的任务结果」──────────────────────
-        combined_result = "\n---\n".join(task_result_texts) if task_result_texts else None
+        combined_data_returns = "\n---\n".join(received_data_returns) if received_data_returns else None
+        combined_task_returns = "\n---\n".join(received_task_returns) if received_task_returns else None
+
         graph.add_node(task_id, "Task",
             started_at=ts_first,
             ended_at=ts_last,
-            输入的任务=task_input_text,
-            收到的任务结果=_text_preview(combined_result, 1000) if combined_result else None,
+            input_task=task_input_text,
+            received_data_returns=combined_data_returns,
+            received_task_returns=combined_task_returns,
         )
 
     return tool_call_map

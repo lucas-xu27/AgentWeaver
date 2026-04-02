@@ -1,0 +1,11 @@
+# Environment variables
+.env
+
+# Python compilation files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Logs
+logs/
+*.log

@@ -8,7 +8,8 @@ logs2graphs.py
 ------
 节点类型:
   - User        : 向 main agent 发消息的真实用户
-  - Task        : 每个 Agent Session（main / subagent）
+  - Task        : 每个 Agent Session（main / subagent / subtask）
+                  subtask 由 Minimax 模型对 Tool 调用聚类自动生成
   - Tool        : 每次工具调用（toolCall）
   - Data        : 工具返回结果（toolResult）
   - File        : 系统层记录的文件访问路径
@@ -17,11 +18,11 @@ logs2graphs.py
 
 边类型:
   - USER_REQUESTS  : User -> Task
-  - SPAWNS         : Task -> Task  (sessions_spawn)
+  - SPAWNS         : Task -> Task  (sessions_spawn / subtask 聚类)
   - REPORTS_TO     : Task -> Task  (subagent 完成后汇报)
-  - CALLS          : Task -> Tool
+  - CALLS          : Task(subtask) -> Tool  (聚类后由 SubTask 发起)
   - RETURNS        : Tool -> Data
-  - CONSUMES       : Data -> Task
+  - CONSUMES       : Data -> Task(subtask)
   - SPAWNS_PROCESS : Tool -> Process  (时间窗口匹配)
   - ACCESSES_FILE  : Tool -> File     (时间窗口匹配)
   - CALLS_NETWORK  : Tool -> Network  (时间窗口匹配)
@@ -49,10 +50,28 @@ import re
 import glob
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
+from openai import OpenAI
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 工具函数
+# 工具函数 & 预定义数据
 # ─────────────────────────────────────────────────────────────────────────────
+
+TOOL_DESCRIPTIONS = {
+    "read": "Read the contents of a file. Supports text files and images (jpg, png, gif, webp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.",
+    "edit": "Edit a file by replacing exact text. The oldText must match exactly (including whitespace). Use this for precise, surgical edits.",
+    "write": "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.",
+    "exec": "Execute shell commands with background continuation. Use yieldMs/background to continue later via process tool. Use pty=true for TTY-required commands (terminal UIs, coding agents).",
+    "process": "Manage running exec sessions: list, poll, log, write, send-keys, submit, paste, kill.",
+    "cron": "Manage Gateway cron jobs (status/list/add/update/remove/run/runs) and send wake events.\\n\\nACTIONS:\\n- status: Check cron scheduler status\\n- list: List jobs (use includeDisabled:true to include disabled)\\n- add: Create job (requires job object, see schema below)\\n- update: Modify job (requires jobId + patch object)\\n- remove: Delete job (requires jobId)\\n- run: Trigger job immediately (requires jobId)\\n- runs: Get job run history (requires jobId)\\n- wake: Send wake event (requires text, optional mode)\\n\\nJOB SCHEMA (for add action):\\n{\\n  \"name\": \"string (optional)\",\\n  \"schedule\": { ... },      // Required: when to run\\n  \"payload\": { ... },       // Required: what to execute\\n  \"delivery\": { ... },      // Optional: announce summary or webhook POST\\n  \"sessionTarget\": \"main\" | \"isolated\",  // Required\\n  \"enabled\": true | false   // Optional, default true\\n}\\n\\nSCHEDULE TYPES (schedule.kind):\\n- \"at\": One-shot at absolute time\\n  { \"kind\": \"at\", \"at\": \"<ISO-8601 timestamp>\" }\\n- \"every\": Recurring interval\\n  { \"kind\": \"every\", \"everyMs\": <interval-ms>, \"anchorMs\": <optional-start-ms> }\\n- \"cron\": Cron expression\\n  { \"kind\": \"cron\", \"expr\": \"<cron-expression>\", \"tz\": \"<optional-timezone>\" }\\n\\nISO timestamps without an explicit timezone are treated as UTC.\\n\\nPAYLOAD TYPES (payload.kind):\\n- \"systemEvent\": Injects text as system event into session\\n  { \"kind\": \"systemEvent\", \"text\": \"<message>\" }\\n- \"agentTurn\": Runs agent with message (isolated sessions only)\\n  { \"kind\": \"agentTurn\", \"message\": \"<prompt>\", \"model\": \"<optional>\", \"thinking\": \"<optional>\", \"timeoutSeconds\": <optional, 0 means no timeout> }\\n\\nDELIVERY (top-level):\\n  { \"mode\": \"none|announce|webhook\", \"channel\": \"<optional>\", \"to\": \"<optional>\", \"bestEffort\": <optional-bool> }\\n  - Default for isolated agentTurn jobs (when delivery omitted): \"announce\"\\n  - announce: send to chat channel (optional channel/to target)\\n  - webhook: send finished-run event as HTTP POST to delivery.to (URL required)\\n  - If the task needs to send to a specific chat/recipient, set announce delivery.channel/to; do not call messaging tools inside the run.\\n\\nCRITICAL CONSTRAINTS:\\n- sessionTarget=\"main\" REQUIRES payload.kind=\"systemEvent\"\\n- sessionTarget=\"isolated\" REQUIRES payload.kind=\"agentTurn\"\\n- For webhook callbacks, use delivery.mode=\"webhook\" with delivery.to set to a URL.\\nDefault: prefer isolated agentTurn jobs unless the user explicitly wants a main-session system event.\\n\\nWAKE MODES (for wake action):\\n- \"next-heartbeat\" (default): Wake on next heartbeat\\n- \"now\": Wake immediately\\n\\nUse jobId as the canonical identifier; id is accepted for compatibility. Use contextMessages (0-10) to add previous messages as context to the job text.",
+    "sessions_list": "List sessions with optional filters and last messages.",
+    "sessions_history": "Fetch message history for a session.",
+    "sessions_send": "Send a message into another session. Use sessionKey or label to identify the target.",
+    "sessions_spawn": "Spawn an isolated session (runtime=\"subagent\" or runtime=\"acp\"). mode=\"run\" is one-shot and mode=\"session\" is persistent/thread-bound. Subagents inherit the parent workspace directory automatically.",
+    "subagents": "List, kill, or steer spawned sub-agents for this requester session. Use this for sub-agent orchestration.",
+    "session_status": "Show a /status-equivalent session status card (usage + time + cost when available). Use for model-use questions (📊 session_status). Optional: set per-session model override (model=default resets overrides).",
+    "memory_search": "Mandatory recall step: semantically search MEMORY.md + memory/*.md (and optional session transcripts) before answering questions about prior work, decisions, dates, people, preferences, or todos; returns top snippets with path + lines. If response has disabled=true, memory retrieval is unavailable and should be surfaced to the user.",
+    "memory_get": "Safe snippet read from MEMORY.md or memory/*.md with optional from/lines; use after memory_search to pull only the needed lines and keep context small."
+}
 
 def _ts_ms(ts) -> int:
     """确保时间戳为毫秒整数。支持 ISO 字符串和数值两种格式。"""
@@ -64,11 +83,8 @@ def _ts_ms(ts) -> int:
         ts_str = ts.rstrip("Z")
         if "+" in ts_str[10:]:
             ts_str = ts_str[:ts_str.rfind("+")]
-        try:
-            dt = datetime.fromisoformat(ts_str).replace(tzinfo=timezone.utc)
-            return int(dt.timestamp() * 1000)
-        except ValueError:
-            return 0
+        dt = datetime.fromisoformat(ts_str).replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
     ts = int(ts)
     if ts < 2_000_000_000_000:
         # seconds 级（Unix epoch < ~63年后） → 转 ms
@@ -191,10 +207,7 @@ def load_sessions(sessions_dir: str) -> Dict[str, List[dict]]:
                 line = line.strip()
                 if not line:
                     continue
-                try:
-                    entries.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
+                entries.append(json.loads(line))
         sessions[session_id] = entries
 
     return sessions
@@ -225,10 +238,7 @@ def load_output_events(output_json: str) -> List[dict]:
             line = line.strip()
             if not line:
                 continue
-            try:
-                events.append(json.loads(line))
-            except json.JSONDecodeError:
-                pass
+            events.append(json.loads(line))
     return events
 
 
@@ -286,8 +296,7 @@ def parse_sessions(
             provider=meta.get("modelProvider"),
             status="completed" if not meta.get("abortedLastRun") else "aborted",
             input_task=task_input_text,
-            received_data_returns=None,
-            received_task_returns=None,
+            received_returns=None,
             started_at=None,
             ended_at=None,
         )
@@ -451,21 +460,18 @@ def parse_sessions(
                     result_content = result_info["msg"].get("content", [])
                     for c in result_content:
                         if isinstance(c, dict) and c.get("type") == "text":
-                            try:
-                                spawn_result = json.loads(c.get("text", "{}"))
-                                child_skey = spawn_result.get("childSessionKey", "")
-                                run_id = spawn_result.get("runId", "")
-                                if child_skey:
-                                    child_task_id = f"task:{child_skey}"
-                                    graph.add_edge(
-                                        task_id, child_task_id, "SPAWNS",
-                                        timestamp=called_at,
-                                        tool_call_id=tc_id,
-                                        run_id=run_id,
-                                        child_session_key=child_skey,
-                                    )
-                            except (json.JSONDecodeError, TypeError):
-                                pass
+                            spawn_result = json.loads(c.get("text", "{}"))
+                            child_skey = spawn_result.get("childSessionKey", "")
+                            run_id = spawn_result.get("runId", "")
+                            if child_skey:
+                                child_task_id = f"task:{child_skey}"
+                                graph.add_edge(
+                                    task_id, child_task_id, "SPAWNS",
+                                    timestamp=called_at,
+                                    tool_call_id=tc_id,
+                                    run_id=run_id,
+                                    child_session_key=child_skey,
+                                )
                 continue  # 不创建 Tool/Data 节点
 
             tool_node_id = f"tool:{tc_id}"
@@ -476,6 +482,7 @@ def parse_sessions(
                 tool_node_id, "Tool",
                 tool_call_id=tc_id,
                 name=tc_name,
+                description=TOOL_DESCRIPTIONS.get(tc_name, ""),
                 arguments=tc_args,
                 session_id=session_id,
                 called_at=called_at,
@@ -530,15 +537,14 @@ def parse_sessions(
             }
 
         # ── 回填 Task「输入的任务」「收到的任务结果」──────────────────────
-        combined_data_returns = "\n---\n".join(received_data_returns) if received_data_returns else None
-        combined_task_returns = "\n---\n".join(received_task_returns) if received_task_returns else None
+        all_returns = received_data_returns + received_task_returns
+        combined_returns = "\n---\n".join(all_returns) if all_returns else None
 
         graph.add_node(task_id, "Task",
             started_at=ts_first,
             ended_at=ts_last,
             input_task=task_input_text,
-            received_data_returns=combined_data_returns,
-            received_task_returns=combined_task_returns,
+            received_returns=combined_returns,
         )
 
     return tool_call_map
@@ -814,31 +820,237 @@ def parse_output_events(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Minimax 聚类：对 Task 下的 Tool 调用进行语义分组，生成 SubTask 节点
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _call_minimax_cluster(tools_info: List[dict], api_key: str) -> List[dict]:
+    """
+    调用 Minimax 模型对工具调用列表进行语义聚类。
+
+    参数:
+        tools_info: [{"index": int, "name": str, "arguments_summary": str}, ...]
+        api_key: Minimax API Key
+
+    返回:
+        [{"label": "子任务描述", "tool_indices": [0, 1, 2]}, ...]
+    """
+    client = OpenAI(
+        base_url="https://api.minimaxi.com/v1",
+        api_key=api_key,
+    )
+
+    tools_desc_lines = []
+    for t in tools_info:
+        tools_desc_lines.append(
+            f"  [{t['index']}] tool={t['name']}, args={t['arguments_summary']}"
+        )
+    tools_desc = "\n".join(tools_desc_lines)
+
+    prompt = (
+        "你是一个任务分析助手。下面是一个 AI Agent 在执行过程中依次调用的工具列表。"
+        "请根据工具的名称和参数，将这些工具调用按语义分组为若干子任务簇。"
+        "每个簇应该代表一个有意义的子任务（例如：'读取配置文件'、'执行数据查询脚本'、'写入报告'等）。\n\n"
+        f"工具调用列表:\n{tools_desc}\n\n"
+        "请严格按照以下 JSON 格式输出，不要包含任何其他文字：\n"
+        '[{"label": "子任务描述", "tool_indices": [0, 1]}, ...]\n'
+        "其中 tool_indices 是上面列表中工具的 index 编号。每个工具必须且只能属于一个簇。"
+    )
+
+    response = client.chat.completions.create(
+        model="MiniMax-Text-01",
+        messages=[
+            {"role": "system", "content": "你是一个精确的任务分析助手，只输出 JSON。"},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.1,
+    )
+
+    result_text = response.choices[0].message.content.strip()
+    # 去掉可能的 markdown 代码块标记
+    if result_text.startswith("```"):
+        lines = result_text.split("\n")
+        # 去掉首行 ```json 和末行 ```
+        lines = [l for l in lines if not l.strip().startswith("```")]
+        result_text = "\n".join(lines)
+
+    clusters = json.loads(result_text)
+    return clusters
+
+
+def cluster_tools_to_subtasks(graph: Graph, api_key: str):
+    """
+    遍历图中每个 Task 节点，收集其直接 CALLS 的 Tool 节点，
+    调用 Minimax 模型进行语义聚类，为每个簇创建一个新的 SubTask 节点，
+    将原来的 Task->Tool 边替换为 Task->SubTask->Tool。
+    """
+    # 收集每个 task_id 对应的 CALLS 边
+    task_tool_edges: Dict[str, List[dict]] = defaultdict(list)
+    for edge in graph.edges:
+        if edge["rel"] == "CALLS":
+            task_tool_edges[edge["src"]].append(edge)
+
+    # 只处理有 Tool 调用的 Task
+    for task_id, calls_edges in task_tool_edges.items():
+        task_node = graph.nodes.get(task_id)
+        if not task_node or task_node.get("type") != "Task":
+            continue
+
+        # 如果该 Task 只有 0 个 tool，跳过
+        if len(calls_edges) == 0:
+            continue
+
+        # 按 call_order 排序
+        calls_edges_sorted = sorted(calls_edges, key=lambda e: e.get("call_order", 0))
+
+        # 收集工具信息用于发送给 Minimax
+        tools_info = []
+        tool_node_ids = []
+        for idx, edge in enumerate(calls_edges_sorted):
+            tool_node_id = edge["dst"]
+            tool_node = graph.nodes.get(tool_node_id, {})
+            tool_name = tool_node.get("name", "unknown")
+            tool_args = tool_node.get("arguments", {})
+            # 生成参数摘要（限制长度避免 token 过多）
+            args_str = json.dumps(tool_args, ensure_ascii=False)
+            if len(args_str) > 200:
+                args_str = args_str[:200] + "..."
+            tools_info.append({
+                "index": idx,
+                "name": tool_name,
+                "arguments_summary": args_str,
+            })
+            tool_node_ids.append(tool_node_id)
+
+        # 调用 Minimax 聚类
+        print(f"  🔄 对 {task_id} 的 {len(tools_info)} 个工具调用进行聚类...")
+        clusters = _call_minimax_cluster(tools_info, api_key)
+        print(f"     → 生成 {len(clusters)} 个子任务簇")
+
+        # 从图中移除原有的 CALLS 边（Task -> Tool）
+        original_calls = {(e["src"], e["dst"], e["rel"]) for e in calls_edges_sorted}
+        graph.edges = [e for e in graph.edges if (e["src"], e["dst"], e["rel"]) not in original_calls]
+        graph._edge_set -= original_calls
+
+        # 为每个簇创建 SubTask 节点和新边
+        for cluster_idx, cluster in enumerate(clusters):
+            label = cluster["label"]
+            indices = cluster["tool_indices"]
+
+            subtask_id = f"subtask:{task_id}:{cluster_idx}"
+
+            # 计算子任务的时间范围（从簇中工具的时间推断）
+            cluster_tool_ids = [tool_node_ids[i] for i in indices if i < len(tool_node_ids)]
+            start_times = []
+            end_times = []
+            for tid in cluster_tool_ids:
+                tnode = graph.nodes.get(tid, {})
+                if tnode.get("called_at"):
+                    start_times.append(tnode["called_at"])
+                if tnode.get("result_at"):
+                    end_times.append(tnode["result_at"])
+
+            subtask_started = min(start_times) if start_times else None
+            subtask_ended = max(end_times) if end_times else None
+
+            # 创建 SubTask 节点
+            graph.add_node(
+                subtask_id,
+                "Task",
+                label=label,
+                task_type="subtask",
+                parent_task=task_id,
+                cluster_index=cluster_idx,
+                tool_count=len(cluster_tool_ids),
+                started_at=subtask_started,
+                ended_at=subtask_ended,
+            )
+
+            # Task -> SubTask (SPAWNS)
+            graph.add_edge(
+                task_id, subtask_id, "SPAWNS",
+                timestamp=subtask_started,
+                cluster_label=label,
+            )
+
+            # SubTask -> Tool (CALLS)
+            for order, tid in enumerate(cluster_tool_ids, start=1):
+                original_edge = None
+                for e in calls_edges_sorted:
+                    if e["dst"] == tid:
+                        original_edge = e
+                        break
+                graph.add_edge(
+                    subtask_id, tid, "CALLS",
+                    timestamp=original_edge.get("timestamp") if original_edge else subtask_started,
+                    call_order=order,
+                )
+
+            # Data -> SubTask (CONSUMES): 将原本指向 task_id 的 CONSUMES 边
+            # 中属于本簇 tool 的 Data 改为指向 subtask_id
+            cluster_tc_ids = set()
+            for tid in cluster_tool_ids:
+                tnode = graph.nodes.get(tid, {})
+                tc_id = tnode.get("tool_call_id", "")
+                if tc_id:
+                    cluster_tc_ids.add(tc_id)
+
+            for edge in graph.edges:
+                if (edge["rel"] == "CONSUMES"
+                        and edge["dst"] == task_id
+                        and edge["src"].startswith("data:")):
+                    data_tc_id = edge["src"].replace("data:", "")
+                    if data_tc_id in cluster_tc_ids:
+                        edge["dst"] = subtask_id
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 主流程
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_graph(sessions_dir: str, output_json: str) -> Graph:
     graph = Graph()
 
-    print(f"[1/4] 加载 sessions 目录: {sessions_dir}")
+    # 读取 .env 文件到环境
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(script_dir)
+    env_path = os.path.join(project_root, ".env")
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    os.environ.setdefault(k.strip(), v.strip())
+
+    # 读取 Minimax API Key
+    api_key = os.environ.get("MINIMAX_API_KEY", "")
+    assert api_key, (
+        "请设置环境变量 MINIMAX_API_KEY，或配置在 .env 文件中，"
+        "可从 https://platform.minimax.io/ 获取"
+    )
+
+    print(f"[1/5] 加载 sessions 目录: {sessions_dir}")
     sessions = load_sessions(sessions_dir)
     sessions_meta = load_sessions_meta(sessions_dir)
     print(f"      发现 {len(sessions)} 个 session 文件，"
           f"{len(sessions_meta)} 条 session 元数据")
 
-    print(f"[2/4] 解析 sessions，构建 Task/User/Tool/Data 节点...")
+    print(f"[2/5] 解析 sessions，构建 Task/User/Tool/Data 节点...")
     tool_call_map = parse_sessions(sessions, sessions_meta, graph)
     print(f"      工具调用数: {len(tool_call_map)}")
 
+    print(f"[3/5] 调用 Minimax 模型对 Tool 调用进行聚类，生成 SubTask 节点...")
+    cluster_tools_to_subtasks(graph, api_key)
+
     if os.path.exists(output_json):
-        print(f"[3/4] 加载系统层事件: {output_json}")
+        print(f"[4/5] 加载系统层事件: {output_json}")
         events = load_output_events(output_json)
         print(f"      共 {len(events)} 条事件")
 
-        print(f"[4/4] 解析系统层事件，构建 Process/File/Network 节点...")
+        print(f"[5/5] 解析系统层事件，构建 Process/File/Network 节点...")
         parse_output_events(events, tool_call_map, graph)
     else:
-        print(f"[3/4] 跳过系统层事件（文件不存在: {output_json}）")
+        print(f"[4/5] 跳过系统层事件（文件不存在: {output_json}）")
 
     stats = graph.to_dict()["stats"]
     print(f"\n✅ 图构建完成:")

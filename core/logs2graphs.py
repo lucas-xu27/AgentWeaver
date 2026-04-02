@@ -283,18 +283,23 @@ def parse_sessions(
         received_data_returns: List[str] = []  # 收集 Data 节点返回
         received_task_returns: List[str] = []  # 收集 subagent 返回
 
+        spawned_by = meta.get("spawnedBy")
+        spawned_by_label = None
+        if spawned_by:
+            parent_meta = sessions_meta.get(spawned_by)
+            if parent_meta:
+                spawned_by_label = parent_meta.get("label", "main" if parent_meta.get("spawnDepth", 0) == 0 else "subagent")
+            else:
+                spawned_by_label = f"task:{spawned_by}"
+
         graph.add_node(
             task_id,
             "Task",
             session_key=skey,
             session_id=session_id,
             label=meta.get("label", "main" if not is_subagent else "subagent"),
-            task_type="subagent" if is_subagent else "main",
-            spawn_depth=meta.get("spawnDepth", 0),
-            spawned_by=meta.get("spawnedBy"),
-            model=meta.get("model"),
-            provider=meta.get("modelProvider"),
-            status="completed" if not meta.get("abortedLastRun") else "aborted",
+            task_type="original",
+            spawned_by=spawned_by_label,
             input_task=task_input_text,
             received_returns=None,
             started_at=None,
@@ -739,15 +744,21 @@ def parse_output_events(
 
     # ── 时间窗口匹配：Tool → Process / File / Network ────────────────────
     #
-    # 策略：对每个 toolCall，取 [called_at, result_at] 时间窗口，
+    # 策略：对每个 toolCall，取 [called_at, data_timestamp] 时间窗口，
+    # 其中 data_timestamp 是对应 Data 节点的 timestamp（工具返回时刻），
     # 寻找在该窗口内 EXEC 的进程；对这些进程的文件访问也关联到 tool。
     #
     for tc_id, tc in tool_call_map.items():
         tool_node_id = tc["tool_node_id"]
         called_at = tc["called_at"] or 0
-        result_at = tc["result_at"] or called_at
         tc_name = tc["tool_name"]
         tc_args = tc["tool_args"]
+
+        # 获取对应 Data 节点的 timestamp 作为时间窗口上界
+        data_node = graph.nodes.get(f"data:{tc_id}")
+        data_ts = data_node.get("timestamp", 0) if data_node else 0
+        # 如果 Data 节点没有 timestamp，回退到 result_at
+        window_end = data_ts if data_ts else (tc["result_at"] or called_at)
 
         # 提取 URL（从 exec/exec_with 工具的 command 参数）
         urls = _extract_urls_from_args(tc_args)
@@ -755,8 +766,8 @@ def parse_output_events(
         for pid, (start_ts, end_ts) in pid_time_range.items():
             if start_ts is None:
                 continue
-            # 进程在 [called_at - 500ms, result_at + 500ms] 窗口内启动
-            if called_at - 500 <= start_ts <= result_at + 500:
+            # 进程在 [called_at, data_timestamp] 窗口内启动
+            if called_at <= start_ts <= window_end:
                 pinfo = process_info.get(pid, {})
                 exec_ev = pinfo.get("exec")
                 if not exec_ev:
@@ -771,30 +782,37 @@ def parse_output_events(
                     timestamp=start_ts,
                 )
 
-                # 关联 Tool → File（通过该进程的文件访问）
+                # 关联 Tool → File（通过该进程的文件访问，仅包含窗口内的）
                 for fev in pinfo.get("files", []):
                     filepath = fev["filepath"]
                     if _is_system_lib(filepath):
+                        continue
+                    # 文件访问时间也必须在 [called_at, window_end] 内
+                    fev_ts = fev.get("timestamp", 0)
+                    if fev_ts and not (called_at <= fev_ts <= window_end):
                         continue
                     file_id = f"file:{filepath}"
                     graph.add_edge(
                         tool_node_id, file_id, "ACCESSES_FILE",
                         tool_call_id=tc_id,
-                        time_delta_ms=fev["timestamp"] - called_at,
+                        time_delta_ms=fev_ts - called_at,
                         count=fev["count"],
-                        timestamp=fev["timestamp"],
+                        timestamp=fev_ts,
                     )
 
-                # 任意进程：关联 Tool → Network（通过该进程已建立的 PROCESS_CONNECTS 边间接取得到）
-                # 如果该进程已有 PROCESS_CONNECTS 边，自动通过图边可以追溯，此处支接明确的 CALLS_NETWORK
+                # 关联 Tool → Network（通过该进程已建立的 PROCESS_CONNECTS 边）
                 for edge in graph.edges:
                     if edge["src"] == proc_id and edge["rel"] == "PROCESS_CONNECTS":
+                        edge_ts = edge.get("timestamp", 0)
+                        # 网络连接时间也必须在 [called_at, window_end] 内
+                        if edge_ts and not (called_at <= edge_ts <= window_end):
+                            continue
                         net_tgt = edge["dst"]
                         graph.add_edge(
                             tool_node_id, net_tgt, "CALLS_NETWORK",
                             tool_call_id=tc_id,
-                            time_delta_ms=start_ts - called_at,
-                            timestamp=start_ts,
+                            time_delta_ms=edge_ts - called_at if edge_ts else 0,
+                            timestamp=edge_ts,
                         )
 
         # 直接文件路径匹配（read/write/edit 工具）
@@ -832,7 +850,7 @@ def _call_minimax_cluster(tools_info: List[dict], api_key: str) -> List[dict]:
         api_key: Minimax API Key
 
     返回:
-        [{"label": "子任务描述", "tool_indices": [0, 1, 2]}, ...]
+        [{"label": "子任务描述", "input_task": "对子任务的总结", "tool_indices": [0, 1, 2]}, ...]
     """
     client = OpenAI(
         base_url="https://api.minimaxi.com/v1",
@@ -852,8 +870,9 @@ def _call_minimax_cluster(tools_info: List[dict], api_key: str) -> List[dict]:
         "每个簇应该代表一个有意义的子任务（例如：'读取配置文件'、'执行数据查询脚本'、'写入报告'等）。\n\n"
         f"工具调用列表:\n{tools_desc}\n\n"
         "请严格按照以下 JSON 格式输出，不要包含任何其他文字：\n"
-        '[{"label": "子任务描述", "tool_indices": [0, 1]}, ...]\n'
+        '[{"label": "子任务简短标签", "input_task": "用一两句话总结该子任务的具体目标和操作内容", "tool_indices": [0, 1]}, ...]\n'
         "其中 tool_indices 是上面列表中工具的 index 编号。每个工具必须且只能属于一个簇。"
+        "label 是子任务的简短标签名，input_task 是对该子任务目标的总结性描述。"
     )
 
     response = client.chat.completions.create(
@@ -934,6 +953,7 @@ def cluster_tools_to_subtasks(graph: Graph, api_key: str):
         # 为每个簇创建 SubTask 节点和新边
         for cluster_idx, cluster in enumerate(clusters):
             label = cluster["label"]
+            input_task = cluster.get("input_task", label)
             indices = cluster["tool_indices"]
 
             subtask_id = f"subtask:{task_id}:{cluster_idx}"
@@ -952,15 +972,33 @@ def cluster_tools_to_subtasks(graph: Graph, api_key: str):
             subtask_started = min(start_times) if start_times else None
             subtask_ended = max(end_times) if end_times else None
 
-            # 创建 SubTask 节点
+            # 收集本簇内所有工具的 Data 返回内容，合并为 received_returns
+            cluster_tc_ids = set()
+            for tid in cluster_tool_ids:
+                tnode = graph.nodes.get(tid, {})
+                tc_id = tnode.get("tool_call_id", "")
+                if tc_id:
+                    cluster_tc_ids.add(tc_id)
+
+            cluster_returns = []
+            for tc_id in cluster_tc_ids:
+                data_node_id = f"data:{tc_id}"
+                data_node = graph.nodes.get(data_node_id)
+                if data_node and data_node.get("content"):
+                    cluster_returns.append(data_node["content"])
+            combined_returns = "\n---\n".join(cluster_returns) if cluster_returns else None
+
+            # 创建 SubTask 节点（与普通 Task 节点字段保持一致）
             graph.add_node(
                 subtask_id,
                 "Task",
+                session_key=task_node.get("session_key"),
+                session_id=task_node.get("session_id"),
                 label=label,
-                task_type="subtask",
-                parent_task=task_id,
-                cluster_index=cluster_idx,
-                tool_count=len(cluster_tool_ids),
+                task_type="generated",
+                spawned_by=task_node.get("label", task_id),
+                input_task=input_task,
+                received_returns=combined_returns,
                 started_at=subtask_started,
                 ended_at=subtask_ended,
             )
@@ -987,13 +1025,6 @@ def cluster_tools_to_subtasks(graph: Graph, api_key: str):
 
             # Data -> SubTask (CONSUMES): 将原本指向 task_id 的 CONSUMES 边
             # 中属于本簇 tool 的 Data 改为指向 subtask_id
-            cluster_tc_ids = set()
-            for tid in cluster_tool_ids:
-                tnode = graph.nodes.get(tid, {})
-                tc_id = tnode.get("tool_call_id", "")
-                if tc_id:
-                    cluster_tc_ids.add(tc_id)
-
             for edge in graph.edges:
                 if (edge["rel"] == "CONSUMES"
                         and edge["dst"] == task_id

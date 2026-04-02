@@ -1,11 +1,5 @@
 # Environment variables
 .env
 
-# Python compilation files
-__pycache__/
-*.py[cod]
-*$py.class
-
-# Logs
-logs/
-*.log
+# macOS Desktop Services Store
+.DS_Store
